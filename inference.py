@@ -1,18 +1,23 @@
 import argparse
 import subprocess
-import python_speech_features
-from scipy.io import wavfile
-from scipy.interpolate import interp1d
+
+import cv2
+import imageio
 import numpy as np
+import os
+import python_speech_features
 import pyworld
 import torch
-from modules.audio2pose import get_pose_from_audio
+import yaml
+from scipy.interpolate import interp1d
+from scipy.io import wavfile
 from skimage import io, img_as_float32
-import cv2
+
+from modules.audio2kp import AudioModel3D
+from modules.audio2pose import get_pose_from_audio
 from modules.generator import OcclusionAwareGenerator
 from modules.keypoint_detector import KPDetector
-from modules.audio2kp import AudioModel3D
-import yaml,os,imageio
+
 
 def draw_annotation_box( image, rotation_vector, translation_vector, color=(255, 255, 255), line_width=2):
     """Draw a 3D box as annotation of pose"""
@@ -59,20 +64,21 @@ def draw_annotation_box( image, rotation_vector, translation_vector, color=(255,
     cv2.line(image, tuple(point_2d[3]), tuple(
         point_2d[8]), color, line_width, cv2.LINE_AA)
 
-def inter_pitch(y,y_flag):
+
+def inter_pitch(y, y_flag):
     frame_num = y.shape[0]
     i = 0
     last = -1
-    while(i<frame_num):
+    while i < frame_num:
         if y_flag[i] == 0:
             while True:
-                if y_flag[i]==0:
+                if y_flag[i] == 0:
                     if i == frame_num-1:
-                        if last !=-1:
+                        if last != - 1:
                             y[last+1:] = y[last]
-                        i+=1
+                        i += 1
                         break
-                    i+=1
+                    i += 1
                 else:
                     break
             if i >= frame_num:
@@ -81,21 +87,21 @@ def inter_pitch(y,y_flag):
                 y[:i] = y[i]
             else:
                 inter_num = i-last+1
-                fy = np.array([y[last],y[i]])
+                fy = np.array([y[last], y[i]])
                 fx = np.linspace(0, 1, num=2)
-                f = interp1d(fx,fy)
-                fx_new = np.linspace(0,1,inter_num)
+                f = interp1d(fx, fy)
+                fx_new = np.linspace(0, 1, inter_num)
                 fy_new = f(fx_new)
                 y[last+1:i] = fy_new[1:-1]
                 last = i
-                i+=1
-
+                i += 1
         else:
             last = i
-            i+=1
+            i += 1
     return y
 
-def get_audio_feature_from_audio(audio_path,norm = True):
+
+def get_audio_feature_from_audio(audio_path, norm=True):
     sample_rate, audio = wavfile.read(audio_path)
     if len(audio.shape) == 2:
         if np.min(audio[:, 0]) <= 0:
@@ -117,8 +123,9 @@ def get_audio_feature_from_audio(audio_path,norm = True):
         cat = np.concatenate([a[:frame_num], b[:frame_num], c[:frame_num], c_flag[:frame_num]], axis=1)
         return cat
 
+
 def audio2head(audio_path, img_path, model_path, save_path):
-    temp_audio="./results/temp.wav"
+    temp_audio = "./results/temp.wav"
     command = ("ffmpeg -y -i %s -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 %s" % (audio_path, temp_audio))
     output = subprocess.call(command, shell=True, stdout=None)
 
@@ -132,13 +139,12 @@ def audio2head(audio_path, img_path, model_path, save_path):
     img = img.transpose((2, 0, 1))
     img = torch.from_numpy(img).unsqueeze(0).cuda()
 
-
     ref_pose_rot, ref_pose_trans = get_pose_from_audio(img, audio_feature, model_path)
     torch.cuda.empty_cache()
 
     config_file = r"./config/vox-256.yaml"
     with open(config_file) as f:
-        config = yaml.load(f)
+        config = yaml.load(f, Loader=yaml.FullLoader)
     kp_detector = KPDetector(**config['model_params']['kp_detector_params'],
                              **config['model_params']['common_params'])
     generator = OcclusionAwareGenerator(**config['model_params']['generator_params'],
@@ -146,10 +152,10 @@ def audio2head(audio_path, img_path, model_path, save_path):
     kp_detector = kp_detector.cuda()
     generator = generator.cuda()
 
-    opt = argparse.Namespace(**yaml.load(open("./config/parameters.yaml")))
+    opt = argparse.Namespace(**yaml.load(open("./config/parameters.yaml"), Loader=yaml.FullLoader))
     audio2kp = AudioModel3D(opt).cuda()
 
-    checkpoint  = torch.load(model_path)
+    checkpoint = torch.load(model_path)
     kp_detector.load_state_dict(checkpoint["kp_detector"])
     generator.load_state_dict(checkpoint["generator"])
     audio2kp.load_state_dict(checkpoint["audio2kp"])
@@ -160,7 +166,7 @@ def audio2head(audio_path, img_path, model_path, save_path):
     
     audio_f = []
     poses = []
-    pad = np.zeros((4,41),dtype=np.float32)
+    pad = np.zeros((4, 41), dtype=np.float32)
     for i in range(0, frames, opt.seq_len // 2):
         temp_audio = []
         temp_pos = []
@@ -180,7 +186,7 @@ def audio2head(audio_path, img_path, model_path, save_path):
         audio_f.append(temp_audio)
         poses.append(temp_pos)
         
-    audio_f = torch.from_numpy(np.array(audio_f,dtype=np.float32)).unsqueeze(0)
+    audio_f = torch.from_numpy(np.array(audio_f, dtype=np.float32)).unsqueeze(0)
     poses = torch.from_numpy(np.array(poses, dtype=np.float32)).unsqueeze(0)
 
     bs = audio_f.shape[1]
@@ -188,11 +194,8 @@ def audio2head(audio_path, img_path, model_path, save_path):
     total_frames = 0
     
     for bs_idx in range(bs):
-        t = {}
+        t = {"audio": audio_f[:, bs_idx].cuda(), "pose": poses[:, bs_idx].cuda(), "id_img": img}
 
-        t["audio"] = audio_f[:, bs_idx].cuda()
-        t["pose"] = poses[:, bs_idx].cuda()
-        t["id_img"] = img
         kp_gen_source = kp_detector(img)
 
         gen_kp = audio2kp(t)
@@ -204,8 +207,7 @@ def audio2head(audio_path, img_path, model_path, save_path):
             end_id = opt.seq_len // 4 * 3
 
         for frame_bs_idx in range(startid, end_id):
-            tt = {}
-            tt["value"] = gen_kp["value"][:, frame_bs_idx]
+            tt = {"value": gen_kp["value"][:, frame_bs_idx]}
             if opt.estimate_jacobian:
                 tt["jacobian"] = gen_kp["jacobian"][:, frame_bs_idx]
             out_gen = generator(img, kp_source=kp_gen_source, kp_driving=tt)
@@ -226,7 +228,7 @@ def audio2head(audio_path, img_path, model_path, save_path):
     log_dir = save_path
     if not os.path.exists(os.path.join(log_dir, "temp")):
         os.makedirs(os.path.join(log_dir, "temp"))
-    image_name = os.path.basename(img_path)[:-4]+ "_" + os.path.basename(audio_path)[:-4] + ".mp4"
+    image_name = os.path.basename(img_path)[:-4] + "_" + os.path.basename(audio_path)[:-4] + ".mp4"
 
     video_path = os.path.join(log_dir, "temp", image_name)
 
@@ -240,12 +242,12 @@ def audio2head(audio_path, img_path, model_path, save_path):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--audio_path",default=r"./demo/audio/intro.wav",help="audio file sampled as 16k hz")
-    parser.add_argument("--img_path",default=r"./demo/img/paint.jpg", help="reference image")
-    parser.add_argument("--save_path",default=r"./results", help="save path")
-    parser.add_argument("--model_path",default=r"./checkpoints/audio2head.pth.tar", help="pretrained model path")
+    parser.add_argument("--audio_path", default=r"./demo/audio/intro.wav", help="audio file sampled as 16k hz")
+    parser.add_argument("--img_path", default=r"./demo/img/paint.jpg", help="reference image")
+    parser.add_argument("--save_path", default=r"./results", help="save path")
+    parser.add_argument("--model_path", default=r"./checkpoints/audio2head.pth.tar", help="pretrained model path")
 
     parse = parser.parse_args()
 
-    os.makedirs(parse.save_path,exist_ok=True)
-    audio2head(parse.audio_path,parse.img_path,parse.model_path,parse.save_path)
+    os.makedirs(parse.save_path, exist_ok=True)
+    audio2head(parse.audio_path, parse.img_path, parse.model_path, parse.save_path)
